@@ -110,3 +110,235 @@ def test_division_and_team_resolution():
     assert STRUCTURE.resolve_division("Western") == "*WST"
     assert STRUCTURE.resolve_team("iron oaks")["id"] == 501
     assert STRUCTURE.resolve_team("502")["name"] == "Stone Circle"
+
+
+def test_reporting_snapshot_contains_all_trainees_and_milestones():
+    from mtp_cli.reporting import build_snapshot
+
+    tr = make_tracker()
+    collected = dt.datetime(2026, 11, 4, 20, 0, tzinfo=dt.timezone.utc)
+
+    snapshot = build_snapshot(tr, collected)
+
+    assert snapshot["schema_version"] == 1
+    assert snapshot["collected_at"] == "2026-11-04T20:00:00Z"
+    assert snapshot["summary"]["total_trainees"] == 2
+
+    assert {
+        trainee["name"] for trainee in snapshot["trainees"]
+    } == {"Doe, John", "Smith, Jane"}
+
+    assert snapshot["summary"]["status_counts"]["In progress"] == 2
+
+    john = next(
+        t for t in snapshot["trainees"]
+        if t["name"] == "Doe, John"
+    )
+
+    assert len(john["milestones"]) == 18
+
+    fun = next(
+        m for m in john["milestones"]
+        if m["goalId"] == 11
+    )
+    assert fun["done"] is True
+    assert fun["completedDate"] == "2026-03-04"
+
+
+def test_reporting_snapshot_rejects_naive_datetime():
+    from mtp_cli.reporting import build_snapshot
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        build_snapshot(
+            make_tracker(),
+            dt.datetime(2026, 11, 4, 12, 0),
+        )
+
+
+def test_report_command_writes_json_file(tmp_path):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    from mtp_cli.cli import cmd_report
+
+    output = tmp_path / "snapshot.json"
+    session = SimpleNamespace(tracker=make_tracker())
+    args = SimpleNamespace(output=str(output))
+
+    result = asyncio.run(cmd_report(session, args))
+
+    assert result == 0
+    assert output.exists()
+
+    raw = output.read_bytes()
+    assert raw.endswith(b"\n")
+
+    snapshot = json.loads(raw)
+    assert snapshot["summary"]["total_trainees"] == 2
+    assert {
+        trainee["name"] for trainee in snapshot["trainees"]
+    } == {"Doe, John", "Smith, Jane"}
+
+
+def test_report_command_refuses_to_overwrite(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    from mtp_cli.cli import UsageError, cmd_report
+
+    output = tmp_path / "snapshot.json"
+    original = b"existing file must remain unchanged\n"
+    output.write_bytes(original)
+
+    session = SimpleNamespace(tracker=make_tracker())
+    args = SimpleNamespace(output=str(output))
+
+    with pytest.raises(UsageError, match="refusing to overwrite"):
+        asyncio.run(cmd_report(session, args))
+
+    assert output.read_bytes() == original
+
+
+def test_snapshot_indexed_milestones_match_tracker():
+    from mtp_cli.reporting import build_snapshot
+
+    tracker = make_tracker()
+    trainees, _ = tracker.trainees(status="all")
+    first = trainees[0]
+
+    optional_goal = next(
+        goal for goal in model.GOALS if goal.get("optional")
+    )
+
+    tracker._events["synthetic-optional"] = {
+        "person": first.id,
+        "goal": optional_goal["id"],
+        "howDone": 2,
+        "completedDate": "2026-04-01",
+        "note": "Synthetic optional event",
+    }
+
+    tracker._events["synthetic-earlier"] = {
+        "person": first.id,
+        "goal": 11,
+        "howDone": 1,
+        "plannedDate": "2026-05-01",
+    }
+
+    tracker._events["synthetic-later"] = {
+        "person": first.id,
+        "goal": 11,
+        "howDone": 2,
+        "completedDate": "2026-05-02",
+        "note": "Last matching event",
+    }
+
+    collected = dt.datetime(
+        2026, 11, 4, 20, 0, tzinfo=dt.timezone.utc
+    )
+    snapshot = build_snapshot(tracker, collected)
+
+    expected = {
+        trainee.id: [
+            milestone.as_dict()
+            for milestone in tracker.milestones(trainee)
+        ]
+        for trainee in trainees
+    }
+
+    for record in snapshot["trainees"]:
+        assert record["milestones"] == expected[record["id"]]
+
+    first_record = next(
+        record for record in snapshot["trainees"]
+        if record["id"] == first.id
+    )
+
+    duplicate_goal = next(
+        milestone for milestone in first_record["milestones"]
+        if milestone["goalId"] == 11
+    )
+    assert duplicate_goal["eventId"] == "synthetic-later"
+
+    optional = next(
+        milestone for milestone in first_record["milestones"]
+        if milestone["goalId"] == optional_goal["id"]
+    )
+    assert optional["eventId"] == "synthetic-optional"
+
+
+def test_report_serialization_failure_leaves_no_partial_file(
+    tmp_path, monkeypatch,
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    from mtp_cli import cli
+
+    output = tmp_path / "snapshot.json"
+    session = SimpleNamespace(tracker=make_tracker())
+    args = SimpleNamespace(output=str(output))
+
+    def fail_after_partial_write(obj, stream, **kwargs):
+        stream.write('{"incomplete":')
+        raise RuntimeError("synthetic serialization failure")
+
+    monkeypatch.setattr(cli.json, "dump", fail_after_partial_write)
+
+    with pytest.raises(
+        RuntimeError, match="synthetic serialization failure"
+    ):
+        asyncio.run(cli.cmd_report(session, args))
+
+    assert not output.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_report_existing_file_leaves_no_temporary_files(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    from mtp_cli.cli import UsageError, cmd_report
+
+    output = tmp_path / "snapshot.json"
+    original = b"existing snapshot must remain unchanged\\n"
+    output.write_bytes(original)
+
+    session = SimpleNamespace(tracker=make_tracker())
+    args = SimpleNamespace(output=str(output))
+
+    with pytest.raises(UsageError, match="refusing to overwrite"):
+        asyncio.run(cmd_report(session, args))
+
+    assert output.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_report_link_failure_cleans_up_temporary_file(
+    tmp_path, monkeypatch,
+):
+    import asyncio
+    import errno
+    from types import SimpleNamespace
+
+    from mtp_cli import cli
+
+    output = tmp_path / "snapshot.json"
+    session = SimpleNamespace(tracker=make_tracker())
+    args = SimpleNamespace(output=str(output))
+
+    def reject_hard_link(source, destination):
+        raise OSError(
+            errno.EOPNOTSUPP,
+            "hard links not supported",
+        )
+
+    monkeypatch.setattr(cli.os, "link", reject_hard_link)
+
+    with pytest.raises(OSError) as error:
+        asyncio.run(cli.cmd_report(session, args))
+
+    assert error.value.errno == errno.EOPNOTSUPP
+    assert not output.exists()
+    assert list(tmp_path.iterdir()) == []

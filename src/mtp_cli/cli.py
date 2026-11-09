@@ -10,13 +10,18 @@ import json
 import os
 import signal
 import sys
+import tempfile
 from pathlib import Path
 
 from . import model
+from .analysis import analyze_snapshot
 from .model import (EVENT_FIELDS, GOALS, HOW_DONE_OPTIONS, PERSON_FIELDS, STATUS_OPTIONS,
                     NotFound, Structure, Tracker)
 from .rpc import DEFAULT_SERVER, Client, RPCError
 from .store import Store, crawl
+from .reporting import build_snapshot
+from .exports import write_snapshot_csv
+from .comparison import compare_snapshots
 
 STATUS_ALIASES = {
     "not-started": 1, "not-yet-started": 1, "in-progress": 2, "active": 2,
@@ -180,6 +185,51 @@ def change_lines(title: str, old: dict, changes: dict, labels: dict, render=None
 
 
 # ---------------------------------------------------------------- commands
+
+async def cmd_report(s: Session, args) -> int:
+    collected_at = dt.datetime.now(dt.timezone.utc)
+    snapshot = build_snapshot(s.tracker, collected_at)
+
+    if args.output:
+        output = Path(args.output).expanduser()
+    else:
+        stamp = collected_at.strftime("%Y%m%d-%H%M%S")
+        output = Path("reports") / f"mtp-snapshot-{stamp}.json"
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temporary_path = Path(f.name)
+            json.dump(snapshot, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Atomic publication without overwriting an existing snapshot.
+        os.link(temporary_path, output)
+
+    except FileExistsError:
+        raise UsageError(
+            f"refusing to overwrite existing file: {output}"
+        ) from None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+    print(f"Saved snapshot: {output}")
+    print(f"Trainees: {snapshot['summary']['total_trainees']}")
+    print(f"Milestone records: {sum(len(t['milestones']) for t in snapshot['trainees'])}")
+    return 0
+
 
 async def cmd_search(s: Session, args) -> int:
     status = parse_status(args.status, allow_filters=True) if args.status else 2
@@ -374,6 +424,306 @@ def cmd_milestones_offline(args) -> int:
     return 0
 
 
+
+def cmd_analyze_offline(args) -> int:
+    """Analyze a saved snapshot without connecting to the tracker."""
+    path = Path(args.snapshot).expanduser()
+
+    try:
+        with path.open(encoding="utf-8") as f:
+            snapshot = json.load(f)
+        result = analyze_snapshot(snapshot)
+    except (OSError, ValueError) as e:
+        print(f"mtp analyze: {e}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+
+    reference_date = result["reference_date"]
+    total = result["total_trainees"]
+
+    print(f"MTP Snapshot Analysis — {reference_date}")
+    print(f"Total trainees: {total:,}")
+
+    print()
+    print("STATUS")
+    for name, count in result["status_counts"].items():
+        percent = 100 * count / total if total else 0
+        print(f"  {name:<28} {count:>4}  ({percent:5.1f}%)")
+
+    print()
+    print("INACTIVITY — IN-PROGRESS TRAINEES ONLY")
+    for name, count in result["inactivity_counts"].items():
+        print(f"  {name:<12} {count:>4}")
+
+    print()
+    print("ACTIVE MENTOR WORKLOAD — IN-PROGRESS TRAINEES")
+    for name, count in result["active_mentor_workload"].items():
+        print(f"  {name:<28} {count:>4}")
+
+    print()
+    print("DIVISIONS")
+    print(f"  {'Division':<28} {'Trainees':>8} {'Active':>8} {'Milestone completion':>22}")
+    for name, item in result["division_summary"].items():
+        pct = item["milestone_completion_percent"]
+        pct_text = f"{pct:.1f}%" if pct is not None else "n/a"
+        print(f"  {name:<28} {item['trainees']:>8} {item['in_progress']:>8} {pct_text:>22}")
+
+    print()
+    print("TEAMS")
+    print(f"  {'Team':<32} {'Trainees':>8} {'Active':>8} {'Milestone completion':>22}")
+    for name, item in result["team_summary"].items():
+        pct = item["milestone_completion_percent"]
+        pct_text = f"{pct:.1f}%" if pct is not None else "n/a"
+        print(f"  {name:<32} {item['trainees']:>8} {item['in_progress']:>8} {pct_text:>22}")
+
+    print()
+    print("DATA QUALITY")
+    for name, count in result["data_quality"].items():
+        print(f"  {name.replace('_', ' '):<32} {count:>4}")
+
+    if args.details:
+        detail_bands = (
+            "Attention", "Stalled", "Extended", "Unknown", "Future"
+        )
+
+        print()
+        print("TRAINEES REQUIRING ATTENTION")
+        print("(In-progress trainees; sorted by days since recorded activity)")
+
+        for band in detail_bands:
+            people = result["inactivity_trainees"][band]
+            print()
+            print(f"{band.upper()} — {len(people)} trainee(s)")
+
+            if not people:
+                print("  None")
+                continue
+
+            for person in people:
+                days = person["days_since_activity"]
+                if days is None:
+                    activity = "unknown days"
+                elif days < 0:
+                    activity = f"{abs(days)} days in the future"
+                else:
+                    activity = f"{days} days"
+
+                print(
+                    f"  {person['name']} | {person['division']} | "
+                    f"{person['team']} | Mentor: {person['mentor']} | "
+                    f"Last activity: {activity}"
+                )
+
+        print()
+        print("MENTOR ATTENTION SUMMARY")
+        print(
+            f"  {'Mentor':<28} {'Active':>6} {'Current':>8} "
+            f"{'Attention':>10} {'Stalled':>8} {'Extended':>9} "
+            f"{'Unknown':>8} {'Future':>7}"
+        )
+
+        for mentor, item in result["mentor_attention_summary"].items():
+            bands = item["inactivity"]
+            print(
+                f"  {mentor:<28} "
+                f"{item['total_in_progress']:>6} "
+                f"{bands['Current']:>8} "
+                f"{bands['Attention']:>10} "
+                f"{bands['Stalled']:>8} "
+                f"{bands['Extended']:>9} "
+                f"{bands['Unknown']:>8} "
+                f"{bands['Future']:>7}"
+            )
+
+        print()
+        print("DUPLICATE REVIEW")
+        review = result["duplicate_review"]
+        print(
+            f"  {review['repeated_name_groups']} repeated-name group(s); "
+            f"{review['records_in_groups']} record(s) involved"
+        )
+        print(
+            "  Confidence describes pairwise evidence, not whether "
+            "all records in a group represent one person."
+        )
+
+        if not review["groups"]:
+            print("  No repeated names found.")
+        else:
+            for group in review["groups"]:
+                print()
+                print(
+                    f"  {group['name']} — "
+                    f"strongest pair: {group['confidence']}; "
+                    f"weakest pair: {group['lowest_pair_confidence']} "
+                    f"({group['record_count']} records)"
+                )
+
+                for record in group["records"]:
+                    print(
+                        f"    {record['division'] or 'No division'} | "
+                        f"{record['team'] or 'No team'} | "
+                        f"{record['status'] or 'No status'} | "
+                        f"Mentor: {record['mentor'] or 'Unassigned'} | "
+                        f"Completed milestones: "
+                        f"{record['completed_milestones']}"
+                    )
+
+                for comparison in group["comparisons"]:
+                    print(
+                        f"    Pair assessment: {comparison['confidence']}"
+                    )
+                    for item in comparison["evidence"]:
+                        print(f"      - {item}")
+
+
+    return 0
+
+
+def cmd_export_offline(args) -> int:
+    """Export CSV data from a saved snapshot without connecting to the tracker."""
+    snapshot_path = Path(args.snapshot).expanduser()
+    output_path = (
+        Path(args.output).expanduser()
+        if args.output
+        else Path("reports") / f"{snapshot_path.stem}-{args.type}.csv"
+    )
+
+    try:
+        with snapshot_path.open(encoding="utf-8") as f:
+            snapshot = json.load(f)
+
+        count = write_snapshot_csv(snapshot, args.type, output_path)
+
+    except (OSError, ValueError) as e:
+        print(f"mtp export: {e}", file=sys.stderr)
+        return 2
+
+    print(f"Saved {count:,} rows to {output_path}")
+
+    if args.type == "duplicates":
+        print("Duplicate candidates are for manual review; confidence is not proof of identity.")
+
+    return 0
+
+
+def cmd_compare_offline(args) -> int:
+    """Compare two saved snapshots without connecting to the tracker."""
+    try:
+        with Path(args.older).expanduser().open(encoding="utf-8") as f:
+            older = json.load(f)
+        with Path(args.newer).expanduser().open(encoding="utf-8") as f:
+            newer = json.load(f)
+
+        result = compare_snapshots(older, newer)
+
+    except (OSError, ValueError, TypeError) as e:
+        print(f"mtp compare: {e}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+
+    print(
+        f"MTP Snapshot Comparison — "
+        f"{result['older_snapshot_date']} → {result['newer_snapshot_date']}"
+    )
+    print(f"Elapsed days: {result['elapsed_days']}")
+
+    totals = result["totals"]
+    print("\nTRAINEE TOTALS")
+    print(
+        f"  Before: {totals['before']:,}  "
+        f"After: {totals['after']:,}  "
+        f"Change: {totals['change']:+,}"
+    )
+
+    print("\nSTATUS CHANGES")
+    for status, item in result["status_changes"].items():
+        print(
+            f"  {status:<28} "
+            f"{item['before']:>5} → {item['after']:>5} "
+            f"({item['change']:+,})"
+        )
+
+    records = result["records"]
+    print("\nRECORD CHANGES")
+    print(f"  Added in newer snapshot:       {records['added_count']}")
+    print(f"  Missing from newer snapshot:   {records['missing_from_newer_count']}")
+    print(f"  Matched records with changes:  {records['changed_count']}")
+    print(f"  Inactivity changes:              {records['inactivity_changed_count']}")
+
+    for heading, key in (
+        ("ADDED IN NEWER SNAPSHOT", "added"),
+        ("MISSING FROM NEWER SNAPSHOT", "missing_from_newer"),
+    ):
+        if records[key]:
+            print(f"\n{heading}")
+            for person in records[key]:
+                print(f"  {person['name']} (ID: {person['id']})")
+
+    if records["changed"]:
+        print("\nCHANGED RECORDS")
+        for person in records["changed"]:
+            fields = ", ".join(person["changes"])
+            print(f"  {person['name']} (ID: {person['id']}): {fields}")
+
+    if records["inactivity_changed"]:
+        print("\nINACTIVITY CHANGES")
+
+        def format_inactivity(value):
+            if value is None:
+                return "Not in progress"
+            return (
+                f"{value['band']} "
+                f"({value['days_since_activity']} days)"
+            )
+
+        for person in records["inactivity_changed"]:
+            before = format_inactivity(person["before"])
+            after = format_inactivity(person["after"])
+            print(
+                f"  {person['name']} (ID: {person['id']}): "
+                f"{before} → {after}"
+            )
+
+    milestones = result["milestone_progress"]
+    print("\nMILESTONE PROGRESS")
+    print(
+        f"  Completed: {milestones['before']['completed']:,} → "
+        f"{milestones['after']['completed']:,} "
+        f"({milestones['completed_change']:+,})"
+    )
+    print(
+        f"  Recorded:  {milestones['before']['total']:,} → "
+        f"{milestones['after']['total']:,} "
+        f"({milestones['total_change']:+,})"
+    )
+
+    ambiguous = result["ambiguous_ids"]
+    print("\nDATA QUALITY / MATCHING")
+    print(f"  Ambiguous IDs in older snapshot: {len(ambiguous['older'])}")
+    print(f"  Ambiguous IDs in newer snapshot: {len(ambiguous['newer'])}")
+    print(
+        f"  Records without IDs: "
+        f"{result['records_without_ids']['older']} older / "
+        f"{result['records_without_ids']['newer']} newer"
+    )
+
+    print(
+        "\nNotes:"
+        "\n  - Ambiguous IDs are excluded from matching."
+        "\n  - Apparent additions or missing records may result from duplicate IDs."
+        "\n  - Added/missing records describe snapshot differences, not confirmed "
+        "program entry or exit."
+    )
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 def build_parser() -> argparse.ArgumentParser:
@@ -388,6 +738,32 @@ def build_parser() -> argparse.ArgumentParser:
     def who(sp):
         sp.add_argument("trainee", help="name (\"Last\", \"First Last\", \"Last, First\") or record id")
         sp.add_argument("-d", "--division", help="narrow the name lookup to a division or region (see `mtp divisions`)")
+
+    sp = sub.add_parser("report", help="save a complete local JSON reporting snapshot")
+    sp.add_argument("-o", "--output", help="output JSON path (default: timestamped file under reports/)")
+
+    sp = sub.add_parser("analyze", help="analyze a saved local JSON snapshot (offline)")
+    sp.add_argument("snapshot", help="path to a saved JSON snapshot")
+    sp.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    sp.add_argument(
+        "--details",
+        action="store_true",
+        help="show inactivity lists, mentor attention, and duplicate review",
+    )
+
+    sp = sub.add_parser("export", help="export CSV data from a saved snapshot (offline)")
+    sp.add_argument("snapshot", help="path to a saved JSON snapshot")
+    sp.add_argument(
+        "--type",
+        required=True,
+        choices=("inactivity", "mentors", "duplicates"),
+        help="type of CSV export",
+    )
+    sp.add_argument("-o", "--output", help="output CSV path (default: reports/<snapshot>-<type>.csv)")
+    sp = sub.add_parser("compare", help="compare two saved JSON snapshots (offline)")
+    sp.add_argument("older", help="path to the older JSON snapshot")
+    sp.add_argument("newer", help="path to the newer JSON snapshot")
+    sp.add_argument("--json", action="store_true", help="print machine-readable JSON")
 
     sp = sub.add_parser("search", help="list trainees, using the same filters as the web UI")
     sp.add_argument("-s", "--status", help="in-progress (default), not-started, completed, paused, left, other, all, or 1-5")
@@ -450,7 +826,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {
-    "search": cmd_search, "show": cmd_show, "update": cmd_update, "milestone": cmd_milestone,
+    "report": cmd_report, "search": cmd_search, "show": cmd_show, "update": cmd_update, "milestone": cmd_milestone,
     "add-trainee": cmd_add_trainee, "divisions": cmd_divisions, "teams": cmd_teams,
     "remove": lambda s, a: cmd_remove(s, a, True), "restore": lambda s, a: cmd_remove(s, a, False),
 }
@@ -467,6 +843,12 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "milestones":
         return cmd_milestones_offline(args)
+    if args.command == "analyze":
+        return cmd_analyze_offline(args)
+    if args.command == "export":
+        return cmd_export_offline(args)
+    if args.command == "compare":
+        return cmd_compare_offline(args)
     load_dotenv()
     try:
         return asyncio.run(run(args))
