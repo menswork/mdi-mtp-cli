@@ -444,6 +444,98 @@ def load_confirmations(args, snapshot_path: Path) -> dict:
     return load_duplicate_confirmations(path)
 
 
+def print_executive_summary(result: dict) -> None:
+    """Print a concise, aggregate-only leadership overview."""
+    total = result["total_trainees"]
+    statuses = result["status_counts"]
+    inactivity = result["inactivity_counts"]
+    active = statuses.get("In progress", 0)
+    completed = statuses.get("Completed program", 0)
+
+    def percentage(count, denominator):
+        return 100 * count / denominator if denominator else 0.0
+
+    snapshot_date = dt.date.fromisoformat(result["reference_date"])
+    today = dt.datetime.now(dt.timezone.utc).date()
+    age_days = (today - snapshot_date).days
+
+    print()
+    print("=" * 65)
+    print("MTP EXECUTIVE SUMMARY")
+    print(
+        f"DATA AS OF: "
+        f"{snapshot_date.strftime('%B')} "
+        f"{snapshot_date.day}, {snapshot_date.year}"
+    )
+
+    if age_days > 7:
+        print(
+            f"HISTORICAL SNAPSHOT — NOT CURRENT DATA "
+            f"({age_days} days old)"
+        )
+    elif age_days < 0:
+        print("WARNING: Snapshot date is in the future")
+
+    print("=" * 65)
+    print(f"  Total trainees: {total:,}")
+    print(
+        f"  Completed program: {completed:,} "
+        f"({percentage(completed, total):.1f}%)"
+    )
+    print(f"  In progress: {active:,}")
+
+    print()
+    print("  Active trainee inactivity:")
+    for band in ("Current", "Attention", "Stalled",
+                 "Extended", "Unknown", "Future"):
+        count = inactivity.get(band, 0)
+        print(
+            f"    {band:<12} {count:>4} "
+            f"({percentage(count, active):5.1f}%)"
+        )
+
+    at_risk = inactivity.get("Stalled", 0) + inactivity.get("Extended", 0)
+    print(
+        f"  Stalled or extended: {at_risk:,} "
+        f"({percentage(at_risk, active):.1f}% of active)"
+    )
+
+    unassigned = result["active_mentor_workload"].get("Unassigned", 0)
+    print(f"  Active trainees without mentor: {unassigned:,}")
+
+    division_risk = {}
+    for band in ("Stalled", "Extended"):
+        for person in result["inactivity_trainees"][band]:
+            division = person["division"]
+            division_risk[division] = division_risk.get(division, 0) + 1
+
+    print()
+    print("  Divisions with most stalled/extended trainees:")
+    if division_risk:
+        ranked = sorted(
+            division_risk.items(),
+            key=lambda item: (-item[1], item[0].casefold()),
+        )
+        for division, count in ranked[:5]:
+            print(f"    {division}: {count}")
+    else:
+        print("    None")
+
+    quality = result["data_quality"]
+    print()
+    print("  Data-quality indicators:")
+    for key, count in quality.items():
+        if count:
+            print(f"    {key.replace('_', ' ')}: {count}")
+    if not any(quality.values()):
+        print("    No issues detected by existing checks")
+
+    print()
+    print("  Note: Inactivity reflects recorded tracker activity,")
+    print("  not necessarily a trainee's actual engagement.")
+    print("  Detailed analysis follows.")
+
+
 def cmd_analyze_offline(args) -> int:
     """Analyze a saved snapshot without connecting to the tracker."""
     path = Path(args.snapshot).expanduser()
@@ -465,6 +557,8 @@ def cmd_analyze_offline(args) -> int:
 
     print(f"MTP Snapshot Analysis — {reference_date}")
     print(f"Total trainees: {total:,}")
+
+    print_executive_summary(result)
 
     print()
     print("STATUS")
@@ -645,7 +739,37 @@ def cmd_compare_offline(args) -> int:
         return 2
 
     if args.json:
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        if args.summary_only:
+            allowed = (
+                "older_snapshot_date",
+                "newer_snapshot_date",
+                "elapsed_days",
+                "totals",
+                "status_changes",
+                "status_transitions",
+                "missing_by_status",
+                "missing_by_division",
+                "milestone_progress",
+                "records_without_ids",
+            )
+            output = {key: result[key] for key in allowed}
+            output["record_counts"] = {
+                key: result["records"][key]
+                for key in (
+                    "added_count",
+                    "missing_from_newer_count",
+                    "changed_count",
+                    "inactivity_changed_count",
+                )
+            }
+            output["ambiguous_id_counts"] = {
+                "older": len(result["ambiguous_ids"]["older"]),
+                "newer": len(result["ambiguous_ids"]["newer"]),
+            }
+        else:
+            output = result
+
+        print(json.dumps(output, indent=2, ensure_ascii=False))
         return 0
 
     print(
@@ -670,6 +794,31 @@ def cmd_compare_offline(args) -> int:
             f"({item['change']:+,})"
         )
 
+    print("\nPROGRAM STATUS TRANSITIONS")
+    transitions = result["status_transitions"]
+
+    if transitions:
+        for item in transitions:
+            print(
+                f"  {item['before']} -> {item['after']}: "
+                f"{item['count']}"
+            )
+    else:
+        print("  No status transitions")
+
+    print(
+        "  Total transitions: "
+        f"{sum(item['count'] for item in transitions)}"
+    )
+
+    print("\nMISSING RECORDS BY PREVIOUS STATUS")
+    for status, count in result["missing_by_status"].items():
+        print(f"  {status}: {count}")
+
+    print("\nMISSING RECORDS BY DIVISION")
+    for division, count in result["missing_by_division"].items():
+        print(f"  {division}: {count}")
+
     records = result["records"]
     print("\nRECORD CHANGES")
     print(f"  Added in newer snapshot:       {records['added_count']}")
@@ -677,39 +826,40 @@ def cmd_compare_offline(args) -> int:
     print(f"  Matched records with changes:  {records['changed_count']}")
     print(f"  Inactivity changes:              {records['inactivity_changed_count']}")
 
-    for heading, key in (
-        ("ADDED IN NEWER SNAPSHOT", "added"),
-        ("MISSING FROM NEWER SNAPSHOT", "missing_from_newer"),
-    ):
-        if records[key]:
-            print(f"\n{heading}")
-            for person in records[key]:
-                print(f"  {person['name']} (ID: {person['id']})")
+    if not args.summary_only:
+        for heading, key in (
+            ("ADDED IN NEWER SNAPSHOT", "added"),
+            ("MISSING FROM NEWER SNAPSHOT", "missing_from_newer"),
+        ):
+            if records[key]:
+                print(f"\n{heading}")
+                for person in records[key]:
+                    print(f"  {person['name']} (ID: {person['id']})")
 
-    if records["changed"]:
-        print("\nCHANGED RECORDS")
-        for person in records["changed"]:
-            fields = ", ".join(person["changes"])
-            print(f"  {person['name']} (ID: {person['id']}): {fields}")
+        if records["changed"]:
+            print("\nCHANGED RECORDS")
+            for person in records["changed"]:
+                fields = ", ".join(person["changes"])
+                print(f"  {person['name']} (ID: {person['id']}): {fields}")
 
-    if records["inactivity_changed"]:
-        print("\nINACTIVITY CHANGES")
+        if records["inactivity_changed"]:
+            print("\nINACTIVITY CHANGES")
 
-        def format_inactivity(value):
-            if value is None:
-                return "Not in progress"
-            return (
-                f"{value['band']} "
-                f"({value['days_since_activity']} days)"
-            )
+            def format_inactivity(value):
+                if value is None:
+                    return "Not in progress"
+                return (
+                    f"{value['band']} "
+                    f"({value['days_since_activity']} days)"
+                )
 
-        for person in records["inactivity_changed"]:
-            before = format_inactivity(person["before"])
-            after = format_inactivity(person["after"])
-            print(
-                f"  {person['name']} (ID: {person['id']}): "
-                f"{before} → {after}"
-            )
+            for person in records["inactivity_changed"]:
+                before = format_inactivity(person["before"])
+                after = format_inactivity(person["after"])
+                print(
+                    f"  {person['name']} (ID: {person['id']}): "
+                    f"{before} → {after}"
+                )
 
     milestones = result["milestone_progress"]
     print("\nMILESTONE PROGRESS")
@@ -737,7 +887,8 @@ def cmd_compare_offline(args) -> int:
     print(
         "\nNotes:"
         "\n  - Ambiguous IDs are excluded from matching."
-        "\n  - Apparent additions or missing records may result from duplicate IDs."
+        "\n  - Apparent additions or missing records may reflect duplicate IDs, "
+        "cleanup, or consolidation."
         "\n  - Added/missing records describe snapshot differences, not confirmed "
         "program entry or exit."
     )
@@ -790,6 +941,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("older", help="path to the older JSON snapshot")
     sp.add_argument("newer", help="path to the newer JSON snapshot")
     sp.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    sp.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="exclude individual trainee records from comparison output",
+    )
 
     sp = sub.add_parser("search", help="list trainees, using the same filters as the web UI")
     sp.add_argument("-s", "--status", help="in-progress (default), not-started, completed, paused, left, other, all, or 1-5")

@@ -628,3 +628,81 @@ def test_human_readable_duplicate_review_hides_record_ids(
     assert "DUPLICATE REVIEW" in output
     assert "Example Division | Example Team" in output
     assert "/u/synthetic-account/posts/" not in output
+
+
+def test_executive_summary_shows_snapshot_date_and_metrics(capsys):
+    from mtp_cli.cli import print_executive_summary
+
+    result = {
+        "reference_date": "2020-01-15",
+        "total_trainees": 10,
+        "status_counts": {
+            "Completed program": 5,
+            "In progress": 4,
+            "Left before completing": 1,
+        },
+        "inactivity_counts": {
+            "Current": 1,
+            "Attention": 1,
+            "Stalled": 1,
+            "Extended": 1,
+            "Unknown": 0,
+            "Future": 0,
+        },
+        "active_mentor_workload": {
+            "Unassigned": 2,
+            "Example Mentor": 2,
+        },
+        "inactivity_trainees": {
+            "Stalled": [
+                {"division": "Example Division"},
+            ],
+            "Extended": [
+                {"division": "Example Division"},
+            ],
+        },
+        "data_quality": {
+            "missing_mentor": 2,
+            "missing_latest_date": 1,
+        },
+    }
+
+    print_executive_summary(result)
+    output = capsys.readouterr().out
+
+    assert "DATA AS OF: January 15, 2020" in output
+    assert "HISTORICAL SNAPSHOT" in output
+    assert "Completed program: 5 (50.0%)" in output
+    assert "Stalled or extended: 2 (50.0% of active)" in output
+    assert "Active trainees without mentor: 2" in output
+    assert "Example Division: 2" in output
+
+
+def test_executive_summary_handles_empty_snapshot(capsys):
+    import datetime as dt
+
+    from mtp_cli.cli import print_executive_summary
+
+    result = {
+        "reference_date": dt.datetime.now(
+            dt.timezone.utc
+        ).date().isoformat(),
+        "total_trainees": 0,
+        "status_counts": {},
+        "inactivity_counts": {},
+        "active_mentor_workload": {},
+        "inactivity_trainees": {
+            "Stalled": [],
+            "Extended": [],
+        },
+        "data_quality": {},
+    }
+
+    print_executive_summary(result)
+    output = capsys.readouterr().out
+
+    assert "Total trainees: 0" in output
+    assert "Completed program: 0 (0.0%)" in output
+    assert "Stalled or extended: 0 (0.0% of active)" in output
+    assert "HISTORICAL SNAPSHOT" not in output
+    assert "No issues detected" in output

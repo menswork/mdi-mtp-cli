@@ -145,10 +145,31 @@ def compare_snapshots(older: dict, newer: dict) -> dict:
     changed = []
     inactivity_changed = []
 
+    status_transitions = Counter()
+    missing_by_status = Counter()
+    missing_by_division = Counter()
+
+    for record_id in old_ids - new_ids:
+        record = old_records[record_id]
+
+        missing_by_status[
+            _normalize_status(record.get("status"))
+        ] += 1
+
+        missing_by_division[
+            record.get("division") or "Unassigned"
+        ] += 1
+
     for record_id in sorted(old_ids & new_ids):
         old = old_records[record_id]
         new = new_records[record_id]
         fields = {}
+
+        old_status = _normalize_status(old.get("status"))
+        new_status = _normalize_status(new.get("status"))
+
+        if old_status != new_status:
+            status_transitions[(old_status, new_status)] += 1
 
         comparisons = (
             ("status", _normalize_status(old.get("status")),
@@ -245,6 +266,22 @@ def compare_snapshots(older: dict, newer: dict) -> dict:
             ),
         },
         "status_changes": status_changes,
+        "status_transitions": [
+            {
+                "before": before,
+                "after": after,
+                "count": count,
+            }
+            for (before, after), count in sorted(
+                status_transitions.items(),
+                key=lambda item: (-item[1], item[0])
+            )
+        ],
+        "missing_by_status": dict(sorted(missing_by_status.items())),
+        "missing_by_division": dict(sorted(
+            missing_by_division.items(),
+            key=lambda item: (-item[1], str(item[0]))
+        )),
         "records": {
             "added": added,
             "missing_from_newer": missing,

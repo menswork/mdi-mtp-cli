@@ -374,3 +374,164 @@ def test_comparison_does_not_load_duplicate_confirmations(
 
     assert result["totals"]["before"] == 1
     assert result["totals"]["after"] == 1
+
+
+def test_aggregate_status_transitions():
+    old = snapshot([
+        trainee(1, status="In progress"),
+        trainee(2, status="In progress"),
+        trainee(3, status="In progress"),
+        trainee(4, status="no data"),
+    ], OLDER)
+
+    new = snapshot([
+        trainee(1, status="Completed program"),
+        trainee(2, status="Completed program"),
+        trainee(3, status="Left before completing"),
+        trainee(4, status="Other / No Data"),
+    ], NEWER)
+
+    result = compare_snapshots(old, new)
+
+    assert result["status_transitions"] == [
+        {
+            "before": "In progress",
+            "after": "Completed program",
+            "count": 2,
+        },
+        {
+            "before": "In progress",
+            "after": "Left before completing",
+            "count": 1,
+        },
+    ]
+
+
+def test_aggregate_missing_record_breakdowns():
+    old = snapshot([
+        trainee(1, status="Completed program", division="Atlas"),
+        trainee(2, status="In progress", division="Atlas"),
+        trainee(3, status="In progress", division="West Bay"),
+        trainee(4, status="Paused before completing", division="OCB"),
+        trainee(5, status="In progress", division="Atlas"),
+    ], OLDER)
+
+    new = snapshot([
+        trainee(5, status="In progress", division="Atlas"),
+    ], NEWER)
+
+    result = compare_snapshots(old, new)
+
+    assert result["missing_by_status"] == {
+        "Completed program": 1,
+        "In progress": 2,
+        "Paused before completing": 1,
+    }
+
+    assert result["missing_by_division"] == {
+        "Atlas": 2,
+        "OCB": 1,
+        "West Bay": 1,
+    }
+
+    assert result["records"]["missing_from_newer_count"] == 4
+
+
+def test_aggregate_results_exclude_identifying_information():
+    old = snapshot([
+        trainee(
+            123456,
+            name="Private Test Person",
+            status="In progress",
+            division="Division A",
+        ),
+    ], OLDER)
+
+    new = snapshot([], NEWER)
+
+    result = compare_snapshots(old, new)
+
+    import json
+
+    aggregate = {
+        "status_transitions": result["status_transitions"],
+        "missing_by_status": result["missing_by_status"],
+        "missing_by_division": result["missing_by_division"],
+    }
+
+    serialized = json.dumps(aggregate)
+
+    assert "Private Test Person" not in serialized
+    assert "123456" not in serialized
+    assert result["records"]["missing_from_newer_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "options, summary_only",
+    [
+        ([], False),
+        (["--summary-only"], True),
+        (["--json"], False),
+        (["--summary-only", "--json"], True),
+    ],
+)
+def test_cli_summary_only_privacy(
+    tmp_path, capsys, options, summary_only
+):
+    """Summary output must not expose individual names or IDs."""
+    import json
+
+    from mtp_cli.cli import build_parser, cmd_compare_offline
+
+    sentinel_name = "PRIVATE_SENTINEL_TRAINEE"
+    sentinel_id = "987654321"
+
+    older = snapshot(
+        [trainee(sentinel_id, name=sentinel_name)],
+        OLDER,
+    )
+    newer = snapshot([], NEWER)
+
+    older_path = tmp_path / "older.json"
+    newer_path = tmp_path / "newer.json"
+
+    older_path.write_text(json.dumps(older), encoding="utf-8")
+    newer_path.write_text(json.dumps(newer), encoding="utf-8")
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "compare",
+        str(older_path),
+        str(newer_path),
+        *options,
+    ])
+
+    assert cmd_compare_offline(args) == 0
+    output = capsys.readouterr().out
+
+    if summary_only:
+        assert sentinel_name not in output
+        assert sentinel_id not in output
+    else:
+        assert sentinel_name in output
+        assert sentinel_id in output
+
+    if "--json" in options:
+        data = json.loads(output)
+
+        if summary_only:
+            assert "records" not in data
+            assert "ambiguous_ids" not in data
+            assert data["record_counts"][
+                "missing_from_newer_count"
+            ] == 1
+            assert "milestone_progress" in data
+            assert "missing_by_status" in data
+            assert "missing_by_division" in data
+        else:
+            assert "records" in data
+    else:
+        assert "MILESTONE PROGRESS" in output
+        assert "DATA QUALITY / MATCHING" in output
+        assert "MISSING RECORDS BY PREVIOUS STATUS" in output
+        assert "MISSING RECORDS BY DIVISION" in output
